@@ -34,6 +34,7 @@
                 <ul class="list-inline">
                     <li class="list-inline-item"><i class="fa fa-check"/>Online Payment</li>
                     <li class="list-inline-item"><i class="fa fa-check" />eCommerce</li>
+                    <li class="list-inline-item"><i class="fa fa-check" />Saved Cards</li>
                 </ul>
             </field>
         </record>

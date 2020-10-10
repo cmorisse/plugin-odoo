@@ -45,6 +45,13 @@
                         </group>
                     </div>
                 </xpath>
+
+                <xpath expr="//group[@name='payment_followup']" position="after">
+                    <div attrs="{'invisible': [('provider','not in',('lyra','lyramulti'))]}">
+                        <group name="lyra_advanced_config" string="Advanced configuration">
+                        </group>
+                    </div>
+                </xpath>
             </field>
         </record>
 

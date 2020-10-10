@@ -13,6 +13,7 @@ from hashlib import sha1, sha256
 import hmac
 import logging
 import math
+import json
 from os import path
 
 from pkg_resources import parse_version
@@ -35,6 +36,14 @@ except ImportError:
     import urllib.parse as urlparse
 
 _logger = logging.getLogger(__name__)
+
+# Maps Odoo save_token selection value Lyra 'vads_page_action'
+vads_page_action_MAP = {
+    'none': u"PAYMENT",  # "Payment (using token or not)"
+    'ask': u"ASK_REGISTER_PAY",  # "Payment with option for the cardholder to create a token"
+    'always': u"REGISTER_PAY",  # Creation of a token during payment"
+}
+
 
 class AcquirerLyra(models.Model):
     _inherit = 'payment.acquirer'
@@ -100,6 +109,18 @@ class AcquirerLyra(models.Model):
     else:
         image_128 = fields.Char()
         state = fields.Char()
+
+    def _get_feature_support(self):
+        """Get advanced feature support by provider.
+
+        Each provider should add its technical in the corresponding
+        key for the following features:
+            * tokenize: support saving payment data in a payment.tokenize
+                        object
+        """
+        res = super()._get_feature_support()
+        res['tokenize'].append('lyra')
+        return res
 
     @api.model
     def multi_add(self, filename):
@@ -186,6 +207,12 @@ class AcquirerLyra(models.Model):
         self.lyra_redirect = True if str(self.lyra_redirect_enabled) == '1' else False
 
         tx_values = dict() # Values to sign in unicode.
+
+        vads_page_action = vads_page_action_MAP.get(self.save_token, '_$NotFound')
+        if vads_page_action == '_$NotFound':
+            _logger.error("Unknown value '%s' for save_token. defaulted to 'never' => vads_page_action='PAYMENT'.")
+            vads_page_action = 'PAYMENT'
+
         tx_values.update({
             'vads_site_id': self.lyra_site_id,
             'vads_amount': str(amount),
@@ -193,7 +220,7 @@ class AcquirerLyra(models.Model):
             'vads_trans_date': str(datetime.utcnow().strftime("%Y%m%d%H%M%S")),
             'vads_trans_id': str(trans_id),
             'vads_ctx_mode': str(self._get_ctx_mode()),
-            'vads_page_action': u'PAYMENT',
+            'vads_page_action': vads_page_action,
             'vads_action_mode': u'INTERACTIVE',
             'vads_payment_config': self._get_payment_config(amount),
             'vads_version': constants.LYRA_PARAMS.get('GATEWAY_VERSION'),
@@ -260,6 +287,7 @@ class AcquirerLyra(models.Model):
     def lyramulti_get_form_action_url(self):
         return self.lyra_gateway_url
 
+
 class TransactionLyra(models.Model):
     _inherit = 'payment.transaction'
 
@@ -318,6 +346,32 @@ class TransactionLyra(models.Model):
 
         return invalid_parameters
 
+    def _lyra_insert_payment_token(self, data):
+        """ Create 'payment.token' using token info returned in IPN payload. """
+        token_model = self.env['payment.token']
+        if 'vads_identifier' not in data:
+            _logger.debug("No Token found in IPN data.")
+            return token_model
+
+        vads_identifier = data['vads_identifier']
+        token_name = "%s - %s - %s (PZ)" % (
+            data['vads_card_brand'],
+            data['vads_card_number'],
+            data['expiry_date']
+        )
+        payment_token_values = {
+            "name": token_name,
+            "acquirer_ref": vads_identifier,
+            "acquirer_id": self.acquirer_id.id,
+            "partner_id": self.partner_id.id,
+        }
+        token_obj = token_model.search([
+            ('acquirer_ref', '=', vads_identifier)
+        ])
+        if not token_obj:
+            token_obj = token_obj.create(payment_token_values)
+        return token_obj
+
     def _lyra_form_validate(self, data):
         lyra_statuses = {
             'success': ['AUTHORISED', 'CAPTURED', 'ACCEPTED'],
@@ -334,7 +388,11 @@ class TransactionLyra(models.Model):
 
         expiry = ''
         if data.get('vads_expiry_month') and data.get('vads_expiry_year'):
-            expiry = data.get('vads_expiry_month').zfill(2) + '/' + data.get('vads_expiry_year')
+            expiry = "{month:0>2}/{year}".format(
+                month=data['vads_expiry_month'],
+                year=data['vads_expiry_year']
+            )
+            data['expiry_date'] = expiry
 
         values = {
             'acquirer_reference': data.get('vads_trans_uuid'),
@@ -352,21 +410,18 @@ class TransactionLyra(models.Model):
 
         status = data.get('vads_trans_status')
         if status in lyra_statuses['success']:
-            values.update({
-                'state': 'done',
-            })
-
+            values["state"] = "done"
             self.write(values)
-
+            token_obj = self._lyra_insert_payment_token(data)
+            if token_obj:
+                self.payment_token_id = token_obj.id
             return True
+
         elif status in lyra_statuses['pending']:
-            values.update({
-                'state': 'pending',
-            })
-
+            values['state'] = 'pending'
             self.write(values)
-
             return True
+
         elif status in lyra_statuses['cancel']:
             self.write({
                 'state_message': 'Payment for transaction #%s is cancelled (%s).' % (self.reference, data.get('vads_result')),
@@ -390,3 +445,5 @@ class TransactionLyra(models.Model):
             self.write(values)
 
             return False
+
+
