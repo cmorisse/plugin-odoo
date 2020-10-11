@@ -32,6 +32,11 @@
                             <field name="lyra_validation_mode" attrs="{'required': [('provider','in',('lyra','lyramulti'))]}" />
                             <field name="lyra_payment_cards" widget="many2many_tags" options="{'no_create': True}" />
                         </group>
+                        <group string="REST API">
+                            <field name="lyra_rest_api_server_url" attrs="{'required': [('save_token','!=', 'none')]}" />
+                            <field name="lyra_rest_api_password_test" attrs="{'required': [('save_token','!=', 'none')]}" />
+                            <field name="lyra_rest_api_password_prod" attrs="{'required': [('save_token','!=', 'none'), ('state','=', 'enabled')]}"  />
+                        </group>
                         <group name="lyra_selective_3ds" string="SELECTIVE 3DS">
                             <field name="lyra_threeds_min_amount" />
                         </group>
