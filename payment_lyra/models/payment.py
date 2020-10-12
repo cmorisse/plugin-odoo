@@ -15,6 +15,7 @@ import logging
 import math
 import json
 import requests
+import dateutil
 from os import path
 
 from pkg_resources import parse_version
@@ -297,7 +298,7 @@ class AcquirerLyra(models.Model):
 
     def _generate_lyra_auth_header(self):
         """ Generate Lyra REST API auth header according to Shop 'mode' (Production or Test) """
-        if self.state == 'enabled':
+        if self._get_ctx_mode() == 'PRODUCTION':
             assert self.lyra_rest_api_password_prod, "REST API Prod password is undefined"
             rest_api_password = self.lyra_rest_api_password_prod
         else:
@@ -324,16 +325,8 @@ class AcquirerLyra(models.Model):
                 error_msg = " " + (_("Lyra gave us the following info about the problem: '%s'") % lyra_error)
                 raise ValidationError(error_msg)
         resp_dict = resp.json()
-        if resp_dict.get('status')=="ERROR":
-            lyra_error = "%s: %s" % (
-                resp_dict.get('answer', {}).get('errorCode', 'errorCode NotFound'),
-                resp_dict.get('answer', {}).get('errorMessage', 'errorMessage NotFound')
-            )
-            _logger.error(lyra_error)
-            lyra_detailed_error = resp_dict.get('answer', {}).get('detailedErrorMessage', 'detailedErrorMessage NotFound')
-            error_msg = " " + (_("Lyra gave us the following info about the problem: '%s'") % lyra_detailed_error)
-            raise ValidationError(error_msg)
-        return 
+        _logger.debug("Lyra API Response: %s", json.dumps(resp_dict, indent=4))
+        return resp_dict
 
 
 class TransactionLyra(models.Model):
@@ -412,6 +405,7 @@ class TransactionLyra(models.Model):
             "acquirer_ref": vads_identifier,
             "acquirer_id": self.acquirer_id.id,
             "partner_id": self.partner_id.id,
+            "verified": True  # since it comes from IPN
         }
         token_obj = token_model.search([
             ('acquirer_ref', '=', vads_identifier)
@@ -444,7 +438,7 @@ class TransactionLyra(models.Model):
 
         values = {
             'acquirer_reference': data.get('vads_trans_uuid'),
-            'lyra_raw_data': '{}'.format(data),
+            'lyra_raw_data': json.dumps(data, indent=4),
             'html_3ds': html_3ds,
             'lyra_trans_status': data.get('vads_trans_status'),
             'lyra_card_brand': data.get('vads_card_brand'),
@@ -519,21 +513,14 @@ class TransactionLyra(models.Model):
             raise ValidationError(error_msg)
         return tx
 
-
     def _lyra_createPayment_payload(self):
         """ Generate payload for CreatePayment WS Call (using Token based payment)
         """
         assert self.payment_token_id.acquirer_ref, "Missing Required paymentMethodToken"
-        currency_num = tools.find_currency(self.currency_id.name)
-        if currency_num is None:
-            _logger.error('The plugin cannot find a numeric code for the current shop currency {}.'.format(values['currency'].name))
-            # TODO: Check validation error is in the log
-            raise ValidationError(_('The shop currency {} is not supported.').format(values['currency'].name))
-
         create_payment_payload = {
             'orderId': self.reference,
             'contrib': constants.LYRA_PARAMS.get('CMS_IDENTIFIER') + u'_' + constants.LYRA_PARAMS.get('PLUGIN_VERSION') + u'/' + release.version,
-            'currency': currency_num,
+            'currency': self.currency_id.name,
             'amount': int(self.amount * (10 ** self.currency_id.decimal_places)),
             "formAction": "SILENT",  # Effectue un paiement par alias sans passer par le formulaire embarqué.
             'paymentMethodToken':self.payment_token_id.acquirer_ref,  # TODO:
@@ -570,15 +557,71 @@ class TransactionLyra(models.Model):
 
     def _lyra_process_createPayment_response(self, resp_dict):
         """ Process Lyra API createPayement Response and update transaction accordingly. """
+        self.ensure_one()
+        if self.state not in ("draft", "pending"):
+            _logger.info('Lyra: trying to validate an already validated tx (ref %s)', self.reference)
+            return True
+
+        if resp_dict.get('status')=="ERROR":
+            lyra_error = "%s: %s" % (
+                resp_dict.get('answer', {}).get('errorCode', 'errorCode NotFound'),
+                resp_dict.get('answer', {}).get('errorMessage', 'errorMessage NotFound')
+            )
+            _logger.error(lyra_error)
+            lyra_detailed_error = resp_dict.get('answer', {}).get('detailedErrorMessage', 'detailedErrorMessage NotFound')
+            _logger.error(lyra_detailed_error)
+            self.lyra_raw_data = json.dumps(resp_dict, indent=4)
+            self._set_transaction_error(lyra_detailed_error)
+            return False        
+
+        transaction_dict = resp_dict['answer']['transactions'][0]
+        card_details_dict = transaction_dict.get('transactionDetails', {}).get('cardDetails', {})
+        tx_uuid = transaction_dict['uuid']
+        order_status = resp_dict['answer']['orderStatus']
+        #order_cycle = resp_dict['answer']['orderCycle]
+
+        status = transaction_dict['detailedStatus']
+        tx_ts_utc = dateutil.parser.parse(transaction_dict['creationDate']).astimezone(dateutil.tz.gettz('UTC')).replace(tzinfo=None) 
+        tx_update_values = {
+            "date": tx_ts_utc,
+            "acquirer_reference": tx_uuid,
+            "lyra_trans_status": transaction_dict['detailedStatus'],
+            "lyra_raw_data": json.dumps(resp_dict, indent=4),
+            "lyra_card_brand": card_details_dict.get('effectiveBrand'),
+            "lyra_card_number": card_details_dict.get('pan'),
+            "lyra_expiration_date": "%02d/%s" % (
+                int(card_details_dict.get('expiryMonth', 0)),
+                card_details_dict.get('expiryYear')
+            ),
+            "lyra_auth_result": card_details_dict.get('authorizationResponse', {}).get('authorizationResult')
+        }
+
+        if order_status == 'PAID':
+            self.write(tx_update_values)
+            self._set_transaction_done()
+            self.execute_callback()
+            return True
         
+        elif order_status == 'RUNNING':
+            self.write(tx_update_values)
+            self._set_transaction_pending()
+            return True
+
+        elif order_status == 'UNPAID':
+            self.write(tx_update_values)
+            self._set_transaction_cancel()
+            return False
+
+        else:
+            raise ValidationError("Internal Error: unknow orderStatus: '%s'" % order_status)
 
 
     def lyra_s2s_do_transaction(self, **kwargs):
         """ Called to initiate a system to system (s2s) transaction. """
         self.ensure_one()
         createPayzen_payload = self._lyra_createPayment_payload()
-        lyra_resp = self.acquirer_id._lyra_API_request('Charge/CreatePayment', createPayzen_payload)
-        self.
-        return lyra_resp
+        lyra_resp_dict = self.acquirer_id._lyra_API_request('Charge/CreatePayment', createPayzen_payload)
+        lyra_tx_ok = self._lyra_process_createPayment_response(lyra_resp_dict)
+        return lyra_tx_ok
 
 
